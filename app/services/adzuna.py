@@ -142,19 +142,39 @@ def _should_extract(job: dict) -> bool:
 
 
 def _parse(raw: dict) -> dict:
-    """Map a raw Adzuna result to our internal job schema."""
+    """Map a raw Adzuna result to our internal job schema.
+
+    Available Adzuna India API fields
+    ----------------------------------
+    id, title, description, created, redirect_url,
+    company.display_name, location.display_name,
+    category.label, category.tag,
+    salary_min*, salary_max*  (* present only for some non-India listings),
+    salary_is_predicted, latitude, longitude
+
+    Note: contract_time, contract_type, and closing_date are NOT provided
+    by the Adzuna India endpoint.
+    """
+    category_obj = raw.get("category") or {}
     return {
-        "id":          raw.get("id", ""),
-        "title":       raw.get("title", "").strip(),
-        "company":     (raw.get("company") or {}).get("display_name", "N/A"),
-        "location":    (raw.get("location") or {}).get("display_name", ""),
-        "description": (raw.get("description") or "").strip(),
+        "id":                  raw.get("id", ""),
+        "title":               raw.get("title", "").strip(),
+        "company":             (raw.get("company") or {}).get("display_name", "N/A"),
+        "location":            (raw.get("location") or {}).get("display_name", ""),
+        "description":         (raw.get("description") or "").strip(),
         # redirect_url is Adzuna's tracking URL; upgraded to the real employer
         # URL by extract_apply_url() for walk-in and fresher jobs.
-        "url":         raw.get("redirect_url", ""),
-        "created_at":  raw.get("created", ""),
-        "is_walkin":   False,   # set by _classify()
-        "is_fresher":  False,
+        "url":                 raw.get("redirect_url", ""),
+        # posted_at = when the job was posted on Adzuna (Adzuna field: "created")
+        "posted_at":           raw.get("created", ""),
+        # Category from Adzuna (e.g. "IT Jobs", "Engineering Jobs")
+        "category":            category_obj.get("label", ""),
+        # Salary — present for some jobs, null for most India results
+        "salary_min":          raw.get("salary_min"),
+        "salary_max":          raw.get("salary_max"),
+        "salary_is_predicted": bool(int(raw.get("salary_is_predicted", 0) or 0)),
+        "is_walkin":           False,   # set by _classify()
+        "is_fresher":          False,
     }
 
 

@@ -45,17 +45,21 @@ def get_pool() -> asyncpg.Pool:
 
 _CREATE_JOBS = """
 CREATE TABLE IF NOT EXISTS jobs (
-    id                TEXT PRIMARY KEY,
-    title             TEXT NOT NULL,
-    company           TEXT DEFAULT 'N/A',
-    location          TEXT DEFAULT '',
-    description       TEXT DEFAULT '',
-    url               TEXT DEFAULT '',
-    created_at        TEXT DEFAULT '',
-    fetched_at        TEXT NOT NULL,
-    sent_to_telegram  INTEGER DEFAULT 0,
-    is_walkin         INTEGER DEFAULT 0,
-    is_fresher        INTEGER DEFAULT 0
+    id                  TEXT PRIMARY KEY,
+    title               TEXT NOT NULL,
+    company             TEXT    DEFAULT 'N/A',
+    location            TEXT    DEFAULT '',
+    description         TEXT    DEFAULT '',
+    url                 TEXT    DEFAULT '',
+    posted_at           TEXT    DEFAULT '',
+    fetched_at          TEXT    NOT NULL,
+    category            TEXT    DEFAULT '',
+    salary_min          NUMERIC DEFAULT NULL,
+    salary_max          NUMERIC DEFAULT NULL,
+    salary_is_predicted INTEGER DEFAULT 0,
+    sent_to_telegram    INTEGER DEFAULT 0,
+    is_walkin           INTEGER DEFAULT 0,
+    is_fresher          INTEGER DEFAULT 0
 );
 """
 
@@ -142,11 +146,16 @@ async def init_db() -> None:
         else:
             # Step 4 — Add any columns introduced in later versions
             for sql in [
-                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS url              TEXT    DEFAULT ''",
-                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS description      TEXT    DEFAULT ''",
-                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sent_to_telegram INTEGER DEFAULT 0",
-                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_walkin        INTEGER DEFAULT 0",
-                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_fresher       INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS url                 TEXT    DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS description         TEXT    DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS posted_at           TEXT    DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS category            TEXT    DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_min          NUMERIC DEFAULT NULL",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_max          NUMERIC DEFAULT NULL",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS salary_is_predicted INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sent_to_telegram    INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_walkin           INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_fresher          INTEGER DEFAULT 0",
             ]:
                 try:
                     await conn.execute(sql)
@@ -183,19 +192,26 @@ async def insert_job(job: dict) -> None:
             """
             INSERT INTO jobs
                 (id, title, company, location, description,
-                 url, created_at, fetched_at, sent_to_telegram,
-                 is_walkin, is_fresher)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10)
+                 url, posted_at, fetched_at,
+                 category, salary_min, salary_max, salary_is_predicted,
+                 sent_to_telegram, is_walkin, is_fresher)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                    $9, $10, $11, $12,
+                    0, $13, $14)
             ON CONFLICT (id) DO NOTHING
             """,
             job["id"],
             job["title"],
             job.get("company", "N/A"),
             job.get("location", ""),
-            (job.get("description") or "")[:500],   # cap to 500 chars
+            (job.get("description") or "")[:2000],   # extended to 2000 chars
             job.get("url", ""),
-            job.get("created_at", ""),
+            job.get("posted_at", ""),
             datetime.now(timezone.utc).isoformat(),
+            job.get("category", ""),
+            job.get("salary_min"),                   # nullable NUMERIC
+            job.get("salary_max"),                   # nullable NUMERIC
+            1 if job.get("salary_is_predicted") else 0,
             1 if job.get("is_walkin")  else 0,
             1 if job.get("is_fresher") else 0,
         )
@@ -212,17 +228,19 @@ async def mark_sent_to_telegram(job_ids: list[str]) -> None:
         )
 
 
+_JOB_COLUMNS = """
+    id, title, company, location,
+    url, posted_at, fetched_at,
+    category, salary_min, salary_max, salary_is_predicted,
+    is_walkin, is_fresher, description
+"""
+
+
 async def get_jobs(limit: int = 50) -> list[dict]:
     """Return the latest *limit* jobs ordered by fetch time (newest first)."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            """
-            SELECT id, title, company, location, url,
-                   created_at, fetched_at, is_walkin, is_fresher
-            FROM   jobs
-            ORDER  BY fetched_at DESC
-            LIMIT  $1
-            """,
+            f"SELECT {_JOB_COLUMNS} FROM jobs ORDER BY fetched_at DESC LIMIT $1",
             limit,
         )
         return [dict(r) for r in rows]
@@ -232,14 +250,7 @@ async def get_walkin_jobs(limit: int = 50) -> list[dict]:
     """Return jobs classified as walk-in (is_walkin = 1)."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            """
-            SELECT id, title, company, location, url,
-                   created_at, fetched_at, is_walkin, is_fresher
-            FROM   jobs
-            WHERE  is_walkin = 1
-            ORDER  BY fetched_at DESC
-            LIMIT  $1
-            """,
+            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE is_walkin = 1 ORDER BY fetched_at DESC LIMIT $1",
             limit,
         )
         return [dict(r) for r in rows]
@@ -249,14 +260,7 @@ async def get_fresher_jobs(limit: int = 50) -> list[dict]:
     """Return jobs classified as fresher (is_fresher = 1)."""
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
-            """
-            SELECT id, title, company, location, url,
-                   created_at, fetched_at, is_walkin, is_fresher
-            FROM   jobs
-            WHERE  is_fresher = 1
-            ORDER  BY fetched_at DESC
-            LIMIT  $1
-            """,
+            f"SELECT {_JOB_COLUMNS} FROM jobs WHERE is_fresher = 1 ORDER BY fetched_at DESC LIMIT $1",
             limit,
         )
         return [dict(r) for r in rows]
