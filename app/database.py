@@ -1,17 +1,20 @@
 """
 database.py — Async SQLite handler using aiosqlite.
 
-Schema
-------
-jobs  : stores each unique Adzuna job listing
-meta  : key-value store for runtime state (e.g. last_fetch_at timestamp)
+Schema v2 changes
+-----------------
+- Added `is_walkin`  INTEGER column (0/1 flag, set by adzuna classifier)
+- Added `is_fresher` INTEGER column (0/1 flag, set by adzuna classifier)
+- `get_walkin_jobs`  now queries `is_walkin = 1`  (fast indexed lookup)
+- `get_fresher_jobs` now queries `is_fresher = 1` (fast indexed lookup)
+- `_migrate_schema()` safely adds new columns to existing DBs via
+   ALTER TABLE … so Render persistent-disk DBs upgrade without data loss.
 
 Design notes
 ------------
 - `sent_to_telegram` flag prevents duplicate Telegram posts within a session.
-- After a Render cold-start the DB is wiped; jobs re-fetched from Adzuna will
-  be inserted fresh.  To avoid spamming old posts, the fetch route only sends
-  to Telegram if a job's `created_at` is within TELEGRAM_MAX_AGE_HOURS hours.
+- After a Render cold-start the DB may be wiped (free tier = ephemeral /tmp).
+  Jobs re-fetched from Adzuna will be inserted fresh.
 - Cleanup keeps at most MAX_STORED_JOBS rows so SQLite stays tiny.
 """
 import logging
@@ -35,7 +38,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     url               TEXT DEFAULT '',
     created_at        TEXT DEFAULT '',
     fetched_at        TEXT NOT NULL,
-    sent_to_telegram  INTEGER DEFAULT 0
+    sent_to_telegram  INTEGER DEFAULT 0,
+    is_walkin         INTEGER DEFAULT 0,
+    is_fresher        INTEGER DEFAULT 0
 );
 """
 
@@ -46,15 +51,34 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+# Columns added in schema v2 — safely migrated on existing DBs
+_V2_MIGRATIONS = [
+    "ALTER TABLE jobs ADD COLUMN is_walkin  INTEGER DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN is_fresher INTEGER DEFAULT 0",
+]
+
 
 # ── Initialisation ────────────────────────────────────────────────────────────
 
 async def init_db() -> None:
-    """Create tables if they do not exist. Called once at startup."""
+    """
+    Create tables and run migrations. Called once at startup.
+    Migration errors (column already exists) are silently ignored so
+    a fresh DB and an upgraded existing DB both work correctly.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(_CREATE_JOBS)
         await db.execute(_CREATE_META)
         await db.commit()
+
+        # Schema v2 migrations — safe to run on any existing DB
+        for sql in _V2_MIGRATIONS:
+            try:
+                await db.execute(sql)
+                await db.commit()
+            except Exception:
+                pass    # Column already exists — ignore
+
     logger.info("Database initialised at %s", DB_PATH)
 
 
@@ -76,18 +100,21 @@ async def insert_job(job: dict) -> None:
             """
             INSERT OR IGNORE INTO jobs
                 (id, title, company, location, description,
-                 url, created_at, fetched_at, sent_to_telegram)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                 url, created_at, fetched_at, sent_to_telegram,
+                 is_walkin, is_fresher)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
                 job["id"],
                 job["title"],
                 job.get("company", "N/A"),
                 job.get("location", ""),
-                job.get("description", "")[:500],   # cap to 500 chars
+                job.get("description", "")[:500],       # cap to 500 chars
                 job.get("url", ""),
                 job.get("created_at", ""),
                 datetime.now(timezone.utc).isoformat(),
+                1 if job.get("is_walkin")  else 0,      # boolean → int
+                1 if job.get("is_fresher") else 0,
             ),
         )
         await db.commit()
@@ -111,25 +138,28 @@ async def get_jobs(limit: int = 50) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, title, company, location, url, created_at, fetched_at "
-            "FROM jobs ORDER BY fetched_at DESC LIMIT ?",
+            """
+            SELECT id, title, company, location, url,
+                   created_at, fetched_at, is_walkin, is_fresher
+            FROM   jobs
+            ORDER  BY fetched_at DESC
+            LIMIT  ?
+            """,
             (limit,),
         ) as cur:
             return [dict(row) for row in await cur.fetchall()]
 
 
 async def get_walkin_jobs(limit: int = 50) -> list[dict]:
-    """Return jobs whose title or description mentions walk-in keywords."""
+    """Return jobs classified as walk-in (is_walkin = 1)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT id, title, company, location, url, created_at, fetched_at
+            SELECT id, title, company, location, url,
+                   created_at, fetched_at, is_walkin, is_fresher
             FROM   jobs
-            WHERE  lower(title)       LIKE '%walkin%'
-               OR  lower(title)       LIKE '%walk-in%'
-               OR  lower(description) LIKE '%walkin%'
-               OR  lower(description) LIKE '%walk-in%'
+            WHERE  is_walkin = 1
             ORDER  BY fetched_at DESC
             LIMIT  ?
             """,
@@ -139,15 +169,15 @@ async def get_walkin_jobs(limit: int = 50) -> list[dict]:
 
 
 async def get_fresher_jobs(limit: int = 50) -> list[dict]:
-    """Return jobs whose title or description mentions fresher."""
+    """Return jobs classified as fresher (is_fresher = 1)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT id, title, company, location, url, created_at, fetched_at
+            SELECT id, title, company, location, url,
+                   created_at, fetched_at, is_walkin, is_fresher
             FROM   jobs
-            WHERE  lower(title)       LIKE '%fresher%'
-               OR  lower(description) LIKE '%fresher%'
+            WHERE  is_fresher = 1
             ORDER  BY fetched_at DESC
             LIMIT  ?
             """,
@@ -166,10 +196,17 @@ async def get_stats() -> dict:
             "SELECT COUNT(*) FROM jobs WHERE fetched_at LIKE ?", (f"{today}%",)
         ) as cur:
             today_count: int = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM jobs WHERE is_walkin = 1") as cur:
+            walkin_total: int = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM jobs WHERE is_fresher = 1") as cur:
+            fresher_total: int = (await cur.fetchone())[0]
+
     return {
-        "total_jobs": total,
+        "total_jobs":     total,
         "new_jobs_today": today_count,
-        "db_path": DB_PATH,
+        "walkin_jobs":    walkin_total,
+        "fresher_jobs":   fresher_total,
+        "db_path":        DB_PATH,
     }
 
 

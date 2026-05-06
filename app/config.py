@@ -18,10 +18,16 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ── Database ──────────────────────────────────────────────────────────────────
-# On Render free tier the filesystem is ephemeral.
-# Place the DB at /data/jobs.db if a persistent disk is mounted, else local.
-_db_dir = os.getenv("DB_DIR", ".")
-os.makedirs(_db_dir, exist_ok=True)
+# Render persistent disk mounts at /var/data (paid plan required).
+# Free tier uses /tmp (ephemeral — DB wiped on restart, jobs re-fetch in ≤1 hr).
+# Override via DB_DIR env var in Render dashboard.
+_db_dir = os.getenv("DB_DIR", "/var/data")
+try:
+    os.makedirs(_db_dir, exist_ok=True)
+except OSError:
+    # Path not writable (e.g. no persistent disk on free tier) → fall back to /tmp
+    _db_dir = "/tmp"
+    os.makedirs(_db_dir, exist_ok=True)
 DB_PATH: str = os.path.join(_db_dir, "jobs.db")
 
 # ── Business rules ────────────────────────────────────────────────────────────

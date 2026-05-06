@@ -1,39 +1,52 @@
 # Render.com deployment configuration
 # Docs: https://render.com/docs/render-yaml-spec
 #
-# Free tier notes:
-#  - The service auto-sleeps after ~15 min of inactivity.
-#  - Use UptimeRobot to ping /health every 5 min to keep it awake.
-#  - Use cron-job.org to call /trigger-fetch every 60 min.
-#  - The ephemeral disk is wiped on each restart; jobs re-populate on next fetch.
+# Persistent disk notes:
+#  - The `disk` section below adds a 1 GB persistent volume at /var/data.
+#  - Persistent disks require a PAID Render plan (Starter $7/month or higher).
+#  - On the FREE tier: remove the `disk` block and set DB_DIR=/tmp in envVars.
+#    /tmp is ephemeral but jobs re-populate within 1 hour via cron trigger.
+#
+# Cron setup (external — Render free tier has no internal cron):
+#  - UptimeRobot  → ping /health     every 5 min  (keeps server awake)
+#  - cron-job.org → hit /trigger-fetch every 60 min (fetches + sends jobs)
 
 services:
   - type: web
     name: hyderabad-jobs-api
     env: python
-    plan: free                          # Render free tier
-    region: singapore                   # Closest to India
+    plan: free                          # Change to 'starter' to enable persistent disk
+    region: singapore                   # Closest region to India
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
-    # Environment variables — set real values in Render dashboard, NOT here
+    # Health check endpoint — Render uses this to confirm the service is up
+    healthCheckPath: /health
+
+    # Environment variables — set real secret values in Render dashboard
     envVars:
       - key: APP_ID
-        sync: false                     # Set via Render dashboard
+        sync: false                     # Set via Render dashboard (secret)
       - key: APP_KEY
-        sync: false
+        sync: false                     # Set via Render dashboard (secret)
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
       - key: DB_DIR
-        value: /tmp                     # Ephemeral; jobs re-fetch automatically
+        value: /var/data                # Persistent disk path (paid) or /tmp (free)
       - key: FETCH_COOLDOWN_SECONDS
-        value: "3600"
+        value: "3600"                   # 1 hour between Adzuna fetches
       - key: MAX_STORED_JOBS
-        value: "500"
+        value: "500"                    # SQLite row cap
       - key: TELEGRAM_MAX_AGE_HOURS
-        value: "48"
+        value: "48"                     # Only post jobs newer than 48 hours
 
-    # Health check — Render uses this to confirm the service is up
-    healthCheckPath: /health
+  # ── Persistent disk (PAID PLAN ONLY — comment out on free tier) ─────────────
+  # Uncomment the block below when upgrading to Starter plan ($7/month).
+  # This keeps jobs.db alive across restarts so no data is lost.
+  #
+  # disk:
+  #   name: jobs-db
+  #   mountPath: /var/data
+  #   sizeGB: 1
