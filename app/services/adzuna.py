@@ -24,9 +24,15 @@ import logging
 
 import httpx
 
-from app.config import APP_ID, APP_KEY, ADZUNA_BASE_URL
+from app.config import APP_ID, APP_KEY
 
 logger = logging.getLogger(__name__)
+
+# ── Adzuna URL ────────────────────────────────────────────────────────────────
+# IMPORTANT: page number is part of the URL PATH, NOT a query parameter.
+# Adzuna endpoint: /v1/api/jobs/in/search/{page}
+# Sending page= as a query param returns HTTP 400.
+ADZUNA_URL = "https://api.adzuna.com/v1/api/jobs/in/search/{page}"
 
 # ── Search configuration ──────────────────────────────────────────────────────
 
@@ -103,6 +109,13 @@ async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
     """
     Run all SEARCH_QUERIES across PAGES_PER_QUERY pages, merge and deduplicate.
 
+    Key implementation notes
+    ------------------------
+    - Page number goes in the URL PATH: /search/{page} — NOT as a query param.
+      Sending page= as a query param causes Adzuna to return HTTP 400.
+    - Uses what_or for OR logic. Falls back to what= on 400 responses in case
+      the India API endpoint does not support what_or.
+
     Returns
     -------
     (jobs, error_message)
@@ -121,17 +134,20 @@ async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
         query_jobs = 0
 
         for page in range(1, PAGES_PER_QUERY + 1):
+            # Page number goes in the URL path, not as a query param
+            url = ADZUNA_URL.format(page=page)
+
             params = {
                 "app_id":           APP_ID,
                 "app_key":          APP_KEY,
                 "where":            "hyderabad",
-                "what_or":          query,          # OR logic — any word matches
+                "what_or":          query,      # OR logic: any word matches
                 "results_per_page": 50,
-                "page":             page,
                 "sort_by":          "date",
+                # NOTE: no 'page' key here — page is in the URL path above
             }
 
-            raw_results = await _request_with_retry(params)
+            raw_results = await _request_with_retry(url, params, query, page)
             if raw_results is None:
                 errors.append(f"Query='{query}' page={page} failed.")
                 logger.warning("⚠️  Query='%s' page=%d → request failed.", query, page)
@@ -164,9 +180,12 @@ async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
                 all_jobs.append(classified)
                 query_jobs += 1
 
-            # If a page returned fewer than 50 results there are no more pages
+            # Stop early if fewer than 50 results (no more pages)
             if page_count < 50:
-                logger.info("  ✅ Query='%s' — fewer than 50 results on page %d, stopping early.", query, page)
+                logger.info(
+                    "  ✅ Query='%s' page=%d — only %d results, no more pages.",
+                    query, page, page_count,
+                )
                 break
 
         logger.info("📊 Query='%s' → %d unique job(s) added.", query, query_jobs)
@@ -188,27 +207,46 @@ async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
 
 # ── HTTP helper ───────────────────────────────────────────────────────────────
 
-async def _request_with_retry(params: dict) -> list | None:
+async def _request_with_retry(url: str, params: dict, query: str, page: int) -> list | None:
     """
-    Attempt the Adzuna HTTP GET up to 2 times with exponential-ish wait.
-    Returns the list under 'results' key, or None on total failure.
+    Attempt the Adzuna HTTP GET up to 2 times.
+
+    Strategy
+    --------
+    - First tries with what_or= (OR logic).
+    - If Adzuna returns 400 (unsupported param), automatically retries
+      using what= (AND logic, but still broad for single-word queries).
+    - Returns list of raw results, or None on total failure.
     """
-    for attempt in range(1, 3):
+    # Try what_or first; fall back to what= on 400
+    param_variants = [
+        {**params, "what_or": params.get("what_or")},      # attempt 1: OR logic
+        {**{k: v for k, v in params.items() if k != "what_or"}, "what": params.get("what_or")},  # attempt 2: AND
+    ]
+
+    for attempt, p in enumerate(param_variants, start=1):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(ADZUNA_BASE_URL, params=params)
+                resp = await client.get(url, params=p)
+                if resp.status_code == 400 and attempt == 1:
+                    # what_or not accepted — retry with what=
+                    logger.warning(
+                        "Adzuna 400 with what_or= on query='%s' page=%d — retrying with what=",
+                        query, page,
+                    )
+                    continue
                 resp.raise_for_status()
                 data = resp.json()
                 return data.get("results", [])
         except httpx.HTTPStatusError as exc:
             logger.warning(
-                "Adzuna HTTP %s (attempt %d/2) — query='%s' page=%s",
-                exc.response.status_code, attempt,
-                params.get("what_or", "?"), params.get("page", 1),
+                "Adzuna HTTP %s (attempt %d/2) — query='%s' page=%d",
+                exc.response.status_code, attempt, query, page,
             )
         except Exception as exc:
             logger.warning(
-                "Adzuna request error (attempt %d/2): %s", attempt, exc
+                "Adzuna request error (attempt %d/2) — query='%s' page=%d: %s",
+                attempt, query, page, exc,
             )
 
     return None
