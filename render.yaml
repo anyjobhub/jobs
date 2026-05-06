@@ -1,21 +1,20 @@
 # Render.com deployment configuration
 # Docs: https://render.com/docs/render-yaml-spec
 #
-# Persistent disk notes:
-#  - The `disk` section below adds a 1 GB persistent volume at /var/data.
-#  - Persistent disks require a PAID Render plan (Starter $7/month or higher).
-#  - On the FREE tier: remove the `disk` block and set DB_DIR=/tmp in envVars.
-#    /tmp is ephemeral but jobs re-populate within 1 hour via cron trigger.
+# Database setup:
+#  Render automatically provisions a free PostgreSQL instance and injects
+#  DATABASE_URL into the service environment when you attach it in the dashboard.
+#  Go to: Dashboard → your service → Environment → Add Database
 #
 # Cron setup (external — Render free tier has no internal cron):
-#  - UptimeRobot  → ping /health     every 5 min  (keeps server awake)
-#  - cron-job.org → hit /trigger-fetch every 60 min (fetches + sends jobs)
+#  - UptimeRobot  → ping /health        every 5 min  (keeps server awake)
+#  - cron-job.org → hit /trigger-fetch  every 60 min (fetches + stores jobs)
 
 services:
   - type: web
     name: hyderabad-jobs-api
     env: python
-    plan: free                          # Change to 'starter' to enable persistent disk
+    plan: free
     region: singapore                   # Closest region to India
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
@@ -26,27 +25,16 @@ services:
     # Environment variables — set real secret values in Render dashboard
     envVars:
       - key: APP_ID
-        sync: false                     # Set via Render dashboard (secret)
+        sync: false                     # Adzuna API ID (set in Render dashboard)
       - key: APP_KEY
-        sync: false                     # Set via Render dashboard (secret)
+        sync: false                     # Adzuna API key (set in Render dashboard)
       - key: TELEGRAM_BOT_TOKEN
-        sync: false
+        sync: false                     # Optional: for future Telegram use
       - key: TELEGRAM_CHAT_ID
-        sync: false
-      - key: DB_DIR
-        value: /var/data                # Persistent disk path (paid) or /tmp (free)
+        sync: false                     # Optional: for future Telegram use
+      - key: DATABASE_URL
+        sync: false                     # Auto-injected by Render when Postgres DB is attached
       - key: FETCH_COOLDOWN_SECONDS
         value: "3600"                   # 1 hour between Adzuna fetches
       - key: MAX_STORED_JOBS
-        value: "500"                    # SQLite row cap
-      - key: TELEGRAM_MAX_AGE_HOURS
-        value: "48"                     # Only post jobs newer than 48 hours
-
-  # ── Persistent disk (PAID PLAN ONLY — comment out on free tier) ─────────────
-  # Uncomment the block below when upgrading to Starter plan ($7/month).
-  # This keeps jobs.db alive across restarts so no data is lost.
-  #
-  # disk:
-  #   name: jobs-db
-  #   mountPath: /var/data
-  #   sizeGB: 1
+        value: "500"                    # Max rows to keep in jobs table
