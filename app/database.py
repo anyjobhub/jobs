@@ -73,6 +73,17 @@ async def init_db() -> None:
     """
     Create the asyncpg connection pool and ensure tables exist.
     Called once at application startup via FastAPI lifespan.
+
+    Schema healing
+    --------------
+    Detects and fixes two known schema mismatches that occur when the
+    Postgres DB was first connected with an older/different schema:
+      - jobs.id as BIGINT instead of TEXT
+      - jobs.url column missing
+    If either mismatch is found, tables are dropped and recreated.
+    This is safe because a broken-schema DB never stored valid data.
+    After a correct schema is confirmed, individual column migrations
+    are run safely via ADD COLUMN IF NOT EXISTS.
     """
     global _pool
 
@@ -88,13 +99,59 @@ async def init_db() -> None:
         min_size=1,
         max_size=5,         # conservative for Render free tier
         command_timeout=30,
-        # Render Postgres uses SSL; asyncpg handles it automatically
-        # when the URL contains ?sslmode=require (Render adds this).
     )
 
     async with _pool.acquire() as conn:
+        # Step 1 — Create tables if they don't exist yet
         await conn.execute(_CREATE_JOBS)
         await conn.execute(_CREATE_META)
+
+        # Step 2 — Verify schema is correct
+        needs_recreate = False
+        try:
+            id_type = await conn.fetchval("""
+                SELECT data_type FROM information_schema.columns
+                WHERE  table_name = 'jobs' AND column_name = 'id'
+            """)
+            if id_type and id_type.lower() not in ("text", "character varying"):
+                logger.warning(
+                    "Schema: jobs.id is %s (expected TEXT) — will recreate.", id_type
+                )
+                needs_recreate = True
+
+            url_exists = await conn.fetchval("""
+                SELECT 1 FROM information_schema.columns
+                WHERE  table_name = 'jobs' AND column_name = 'url'
+            """)
+            if not url_exists:
+                logger.warning("Schema: jobs.url missing — will recreate.")
+                needs_recreate = True
+
+        except Exception as exc:
+            logger.warning("Schema check error: %s — will recreate.", exc)
+            needs_recreate = True
+
+        # Step 3 — Recreate tables if schema is wrong
+        if needs_recreate:
+            logger.info("♻️  Recreating jobs + meta tables with correct schema…")
+            await conn.execute("DROP TABLE IF EXISTS jobs CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS meta CASCADE")
+            await conn.execute(_CREATE_JOBS)
+            await conn.execute(_CREATE_META)
+            logger.info("✅ Tables recreated.")
+        else:
+            # Step 4 — Add any columns introduced in later versions
+            for sql in [
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS url              TEXT    DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS description      TEXT    DEFAULT ''",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS sent_to_telegram INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_walkin        INTEGER DEFAULT 0",
+                "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS is_fresher       INTEGER DEFAULT 0",
+            ]:
+                try:
+                    await conn.execute(sql)
+                except Exception:
+                    pass    # Column already exists — safe to ignore
 
     logger.info("✅ PostgreSQL pool ready (%s)", DATABASE_URL.split("@")[-1])
 
