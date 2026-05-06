@@ -1,8 +1,14 @@
 """
 adzuna.py — Upgraded Adzuna API integration service.
 
-Upgrade notes (v2)
+Upgrade notes (v4)
 ------------------
+- UPGRADED: `extract_apply_url()` now uses BeautifulSoup to parse the Adzuna
+  HTML detail page and extract the real employer application URL from the
+  "Apply for this job" button. This is more robust than regex and handles
+  HTML entities, varied tag structures, and future markup changes.
+- ADDED: URL extraction is applied ONLY to walk-in and fresher jobs to keep
+  extra HTTP calls minimal and stay within Render free tier limits.
 - FIXED: was using `what` (AND logic) → always 0 results.
   Now uses `what_or` (OR logic) for all queries.
 - FIXED: over-strict keyword filter removed. Now accepts ALL Hyderabad
@@ -13,16 +19,36 @@ Upgrade notes (v2)
 - IMPROVED: location filter broadened (Hyderabad + Secunderabad + Telangana).
 - IMPROVED: detailed per-query, per-page logging.
 
+How apply URL extraction works
+-------------------------------
+  The Adzuna detail page (adzuna.in/details/{id}) is NOT a redirect.
+  It is a full HTML page containing an "Apply for this job" <a> button.
+
+  Step 1 — Fetch the HTML page with httpx (no Selenium needed).
+  Step 2 — Parse with BeautifulSoup; find <a data-js="apply">.
+  Step 3 — Follow that href (adzuna.in/land/ad/{id}?...) which IS a real
+            HTTP redirect → yields the final employer career-page URL.
+  Fallback — any failure returns the original Adzuna URL unchanged.
+
 API call budget
 ---------------
   5 queries × 2 pages = 10 API calls per /trigger-fetch
   With 1-hour cooldown: max 10 × 24 = 240 calls/day
   Adzuna free plan limit: 250 calls/day  ✅  safe
+
+Extra HTTP calls (URL extraction)
+-----------------------------------
+  Only fires for walkin/fresher jobs (typically 10–30% of results).
+  Each extraction = 2 extra HTTP calls (detail page + land/ad redirect).
+  1.5 s polite delay between extractions avoids 429 rate-limits.
+  Failures silently fall back to Adzuna URL — system never crashes.
 """
 
+import asyncio
 import logging
 
 import httpx
+from bs4 import BeautifulSoup
 
 from app.config import APP_ID, APP_KEY
 
@@ -56,6 +82,23 @@ ALLOWED_LOCATIONS = ["hyderabad", "secunderabad", "telangana"]
 WALKIN_KEYWORDS  = ["walkin", "walk-in", "walk in", "interview drive", "interview"]
 FRESHER_KEYWORDS = ["fresher", "freshers", "0-1 year", "0 to 1 year", "entry level", "no experience"]
 
+# ── Apply URL extraction config ───────────────────────────────────────────────
+# Seconds to wait between consecutive URL extractions.
+# Adzuna's /land/ad/ endpoint rate-limits aggressive scrapers (HTTP 429).
+# 1.5 s gap keeps each fetch cycle polite without meaningfully slowing things.
+EXTRACT_DELAY_SECONDS = 1.5
+
+# Browser-like headers reduce the chance of bot-detection on Adzuna pages.
+_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -88,6 +131,16 @@ def _classify(job: dict) -> dict:
     return job
 
 
+def _should_extract(job: dict) -> bool:
+    """
+    Return True if this job should have its apply URL extracted.
+
+    Only walk-in and fresher jobs get the full URL extraction — this limits
+    extra HTTP calls to high-priority listings and keeps Render free tier fast.
+    """
+    return bool(job.get("is_walkin") or job.get("is_fresher"))
+
+
 def _parse(raw: dict) -> dict:
     """Map a raw Adzuna result to our internal job schema."""
     return {
@@ -96,11 +149,146 @@ def _parse(raw: dict) -> dict:
         "company":     (raw.get("company") or {}).get("display_name", "N/A"),
         "location":    (raw.get("location") or {}).get("display_name", ""),
         "description": (raw.get("description") or "").strip(),
+        # redirect_url is Adzuna's tracking URL; upgraded to the real employer
+        # URL by extract_apply_url() for walk-in and fresher jobs.
         "url":         raw.get("redirect_url", ""),
         "created_at":  raw.get("created", ""),
-        "is_walkin":   False,   # will be set by _classify()
+        "is_walkin":   False,   # set by _classify()
         "is_fresher":  False,
     }
+
+
+# ── Apply URL extraction ──────────────────────────────────────────────────────
+
+async def extract_apply_url(adzuna_url: str) -> str:
+    """
+    Extract the real employer job URL from an Adzuna detail page.
+
+    Why not follow_redirects?
+    -------------------------
+    The Adzuna URL (adzuna.in/details/{id}) is NOT an HTTP redirect.
+    It is a full rendered HTML page. The actual employer link only
+    exists inside the HTML as the href of the "Apply for this job" button.
+    follow_redirects=True would stay on the Adzuna detail page (HTTP 200).
+
+    Two-step strategy
+    -----------------
+    Step 1 — Fetch adzuna.in/details/{id} HTML with httpx.
+    Step 2 — Parse HTML with BeautifulSoup; locate <a data-js="apply">.
+             This <a> tag's href points to adzuna.in/land/ad/{id}?... which
+             IS a real HTTP 30x redirect to the employer's career page.
+    Step 3 — Follow the /land/ad/ URL with follow_redirects=True; capture
+             the final URL (e.g. wellsfargojobs.com/...).
+
+    Fallback
+    --------
+    Any failure at any step (network error, 429, missing button, etc.)
+    returns the original adzuna_url unchanged. The system never crashes.
+
+    Parameters
+    ----------
+    adzuna_url : str
+        The Adzuna detail URL from the API's redirect_url field.
+        e.g. https://www.adzuna.in/details/12345?utm_medium=api&...
+
+    Returns
+    -------
+    str
+        Final employer URL if successfully extracted, else adzuna_url.
+    """
+    if not adzuna_url:
+        return adzuna_url
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=10.0,
+            headers=_BROWSER_HEADERS,
+        ) as client:
+
+            # ── Step 1: Fetch the Adzuna detail page HTML ─────────────────────
+            detail_resp = await client.get(adzuna_url)
+            detail_resp.raise_for_status()
+
+            # ── Step 2: Parse HTML — find the Apply button ───────────────────
+            soup = BeautifulSoup(detail_resp.text, "html.parser")
+
+            # Primary selector: <a data-js="apply"> is the most stable attribute
+            # on the Adzuna apply button across all job types.
+            apply_tag = soup.find("a", attrs={"data-js": "apply"})
+
+            # Fallback selectors in order of reliability
+            if apply_tag is None:
+                # rel="nofollow" + text contains "Apply"
+                for tag in soup.find_all("a", rel="nofollow"):
+                    if "apply" in tag.get_text(strip=True).lower():
+                        apply_tag = tag
+                        break
+
+            if apply_tag is None:
+                logger.debug(
+                    "extract_apply_url: no Apply button found on %s",
+                    adzuna_url,
+                )
+                return adzuna_url  # fallback: button not present in HTML
+
+            # href may contain HTML-encoded ampersands (&amp;) — decode them
+            land_url = apply_tag.get("href", "").replace("&amp;", "&")
+
+            if not land_url or "adzuna" not in land_url:
+                # Unexpected href — not the pattern we're looking for
+                logger.debug(
+                    "extract_apply_url: unexpected href %r for %s",
+                    land_url, adzuna_url,
+                )
+                return adzuna_url
+
+            # ── Step 3: Follow /land/ad/ → employer career page ───────────────
+            # This endpoint returns an HTTP 30x redirect to the employer site.
+            # follow_redirects=True (already set on client) will chase it.
+            employer_resp = await client.get(land_url)
+            final_url = str(employer_resp.url)
+
+            # Sanity check: if we still ended up on an Adzuna domain, bail out
+            if "adzuna" in final_url.lower():
+                logger.debug(
+                    "extract_apply_url: still on Adzuna after redirect — %s",
+                    final_url,
+                )
+                return adzuna_url
+
+            logger.info(
+                "✅ apply URL extracted | %s → %s",
+                adzuna_url.split("?")[0],   # strip UTM params for clean logs
+                final_url[:80],
+            )
+            return final_url
+
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status == 429:
+            logger.warning(
+                "extract_apply_url: rate-limited (429) for %s — "
+                "keeping Adzuna URL (will retry on next fetch cycle)",
+                adzuna_url,
+            )
+        else:
+            logger.warning(
+                "extract_apply_url: HTTP %d for %s — keeping Adzuna URL",
+                status, adzuna_url,
+            )
+    except httpx.TimeoutException:
+        logger.warning(
+            "extract_apply_url: timed out for %s — keeping Adzuna URL",
+            adzuna_url,
+        )
+    except Exception as exc:
+        logger.warning(
+            "extract_apply_url: unexpected error for %s: %s — keeping Adzuna URL",
+            adzuna_url, exc,
+        )
+
+    return adzuna_url   # safe fallback on any failure
 
 
 # ── Main fetch function ───────────────────────────────────────────────────────
@@ -108,6 +296,8 @@ def _parse(raw: dict) -> dict:
 async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
     """
     Run all SEARCH_QUERIES across PAGES_PER_QUERY pages, merge and deduplicate.
+    For walk-in and fresher jobs, replace the Adzuna redirect URL with the
+    actual employer application URL extracted from the job detail page HTML.
 
     Key implementation notes
     ------------------------
@@ -115,6 +305,8 @@ async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
       Sending page= as a query param causes Adzuna to return HTTP 400.
     - Uses what_or for OR logic. Falls back to what= on 400 responses in case
       the India API endpoint does not support what_or.
+    - URL extraction is applied ONLY to priority jobs (walk-in / fresher)
+      to minimise extra HTTP calls on the Render free tier.
 
     Returns
     -------
@@ -125,10 +317,11 @@ async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
     if not APP_ID or not APP_KEY:
         return [], "APP_ID or APP_KEY is not configured."
 
-    seen_ids: set[str] = set()
-    all_jobs: list[dict] = []
-    errors:   list[str] = []
-    total_raw = 0
+    seen_ids:      set[str]   = set()
+    all_jobs:      list[dict] = []
+    errors:        list[str]  = []
+    total_raw      = 0
+    extracted_count = 0
 
     for query in SEARCH_QUERIES:
         query_jobs = 0
@@ -174,8 +367,23 @@ async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
                 if not _is_hyderabad_job(r):
                     continue                    # skip non-Hyderabad jobs
 
+                # Parse → classify (sets is_walkin / is_fresher flags)
                 parsed = _parse(r)
                 classified = _classify(parsed)
+
+                # ── Apply URL extraction (priority jobs only) ──────────────────
+                # Walk-in and fresher jobs get their Adzuna redirect URL replaced
+                # with the real employer URL extracted via BeautifulSoup.
+                # All other jobs keep the Adzuna URL to avoid excess HTTP calls.
+                if _should_extract(classified):
+                    original_url = classified["url"]
+                    real_url = await extract_apply_url(original_url)
+                    classified["url"] = real_url
+                    if real_url != original_url:
+                        extracted_count += 1
+                    # Brief pause between extractions to stay within rate limits
+                    await asyncio.sleep(EXTRACT_DELAY_SECONDS)
+
                 seen_ids.add(job_id)
                 all_jobs.append(classified)
                 query_jobs += 1
@@ -195,8 +403,10 @@ async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
     fresher_count = sum(1 for j in all_jobs if j["is_fresher"])
 
     logger.info(
-        "✅ Fetch complete | raw=%d | unique=%d | walkin=%d | fresher=%d | queries=%d",
-        total_raw, len(all_jobs), walkin_count, fresher_count, len(SEARCH_QUERIES),
+        "✅ Fetch complete | raw=%d | unique=%d | walkin=%d | fresher=%d "
+        "| apply_urls_extracted=%d | queries=%d",
+        total_raw, len(all_jobs), walkin_count, fresher_count,
+        extracted_count, len(SEARCH_QUERIES),
     )
 
     if errors and not all_jobs:
