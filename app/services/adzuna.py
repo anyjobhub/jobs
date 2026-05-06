@@ -1,18 +1,17 @@
 """
 adzuna.py — Adzuna API integration service.
 
-Responsibilities
-----------------
-1. Build the API request with correct params.
-2. Execute with a single retry on failure.
-3. Filter results to Hyderabad walk-in / fresher jobs only.
-4. Return a clean list of job dicts ready for DB insertion.
+Fix notes
+---------
+- Adzuna's `what` param uses AND logic (all words must match) → always 0 results
+  for multi-word queries like "walkin interview fresher bpo software developer".
+- Solution: use `what_or` param (OR logic) OR run multiple single-keyword searches.
+- We run 3 targeted searches and merge + deduplicate results.
 
 API quota awareness
 -------------------
-- Only 1 page (50 results) per call.
-- The /trigger-fetch route enforces a 1-hour cooldown so this function
-  is never called more than once per hour.
+- 3 API calls per trigger (still well within free plan: 250 calls/day).
+- /trigger-fetch enforces 1-hour cooldown so max 3 × 24 = 72 calls/day.
 """
 import logging
 
@@ -26,21 +25,38 @@ from app.config import (
     TARGET_CITY,
 )
 
+# Three targeted searches — each returns up to 50 results.
+# Using `what_or` so Adzuna matches ANY of the words (OR logic).
+SEARCH_QUERIES = [
+    "fresher IT software developer",    # IT fresher jobs
+    "walkin interview drive",            # walk-in jobs
+    "bpo customer support fresher",      # BPO/support jobs
+]
+
 logger = logging.getLogger(__name__)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _is_relevant(raw: dict) -> bool:
     """
-    Return True only when:
-      1. location display_name contains TARGET_CITY (hyderabad), AND
+    Return True when:
+      1. location contains TARGET_CITY (hyderabad / secunderabad / telangana), OR
+         the `location_name` field hints at Hyderabad, AND
       2. title or description contains at least one FILTER_KEYWORD.
+
+    Location check is broadened because Adzuna sometimes returns:
+      "Hyderabad, Telangana", "Secunderabad", "Hyderabad District" etc.
     """
     location: str = (
         raw.get("location", {}).get("display_name") or ""
     ).lower()
 
-    if TARGET_CITY not in location:
+    # Accept Hyderabad, Secunderabad (twin city), or Telangana broadly.
+    city_match = any(c in location for c in ["hyderabad", "secunderabad", "telangana"])
+
+    # If location is missing/empty, still accept (Adzuna sometimes omits it
+    # but the `where=hyderabad` param already geo-filters the results).
+    if location and not city_match:
         return False
 
     title = (raw.get("title") or "").lower()
@@ -67,35 +83,67 @@ def _parse(raw: dict) -> dict:
 
 async def fetch_jobs_from_adzuna() -> tuple[list[dict], str | None]:
     """
-    Fetch one page of Adzuna results, filter, and return.
+    Run 3 targeted Adzuna searches and merge deduplicated results.
+
+    Why 3 searches?
+    ---------------
+    Adzuna `what` uses AND logic — a single multi-word query returns 0 results.
+    We use `what_or` (OR logic) with focused keyword groups instead.
 
     Returns
     -------
     (jobs, error_message)
-        jobs          : list of clean job dicts (may be empty)
-        error_message : string if something went wrong, else None
+        jobs          : deduplicated list of clean job dicts
+        error_message : string if ALL searches fail, else None
     """
     if not APP_ID or not APP_KEY:
         return [], "APP_ID or APP_KEY is not configured."
 
-    params = {
-        "app_id":           APP_ID,
-        "app_key":          APP_KEY,
-        "where":            "hyderabad",
-        "what":             "walkin interview fresher bpo software developer",
-        "results_per_page": 50,
-        "sort_by":          "date",
-    }
+    seen_ids: set[str] = set()
+    all_jobs: list[dict] = []
+    errors: list[str] = []
 
-    raw_results = await _request_with_retry(params)
-    if raw_results is None:
-        return [], "Adzuna API request failed after retry."
+    for query in SEARCH_QUERIES:
+        params = {
+            "app_id":           APP_ID,
+            "app_key":          APP_KEY,
+            "where":            "hyderabad",
+            "what_or":          query,      # ← OR logic (any word matches)
+            "results_per_page": 50,
+            "sort_by":          "date",
+        }
 
-    filtered = [_parse(r) for r in raw_results if _is_relevant(r)]
+        raw_results = await _request_with_retry(params)
+        if raw_results is None:
+            errors.append(f"Query '{query}' failed after retry.")
+            continue
+
+        # Log first result's location for debugging zero-result runs
+        if raw_results:
+            sample_loc = (raw_results[0].get("location") or {}).get("display_name", "N/A")
+            logger.info(
+                "Query '%s' → %d raw result(s). Sample location: %s",
+                query, len(raw_results), sample_loc,
+            )
+        else:
+            logger.warning("Query '%s' → 0 raw results from Adzuna.", query)
+
+        for r in raw_results:
+            job_id = r.get("id", "")
+            if job_id in seen_ids:
+                continue          # skip cross-query duplicates
+            if _is_relevant(r):
+                seen_ids.add(job_id)
+                all_jobs.append(_parse(r))
+
+    if errors and not all_jobs:
+        return [], " | ".join(errors)
+
     logger.info(
-        "Adzuna: %d raw result(s) → %d passed filter.", len(raw_results), len(filtered)
+        "Adzuna fetch complete: %d unique job(s) passed filter across %d search(es).",
+        len(all_jobs), len(SEARCH_QUERIES),
     )
-    return filtered, None
+    return all_jobs, None
 
 
 async def _request_with_retry(params: dict) -> list | None:
