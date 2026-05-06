@@ -1,0 +1,39 @@
+# Render.com deployment configuration
+# Docs: https://render.com/docs/render-yaml-spec
+#
+# Free tier notes:
+#  - The service auto-sleeps after ~15 min of inactivity.
+#  - Use UptimeRobot to ping /health every 5 min to keep it awake.
+#  - Use cron-job.org to call /trigger-fetch every 60 min.
+#  - The ephemeral disk is wiped on each restart; jobs re-populate on next fetch.
+
+services:
+  - type: web
+    name: hyderabad-jobs-api
+    env: python
+    plan: free                          # Render free tier
+    region: singapore                   # Closest to India
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    # Environment variables — set real values in Render dashboard, NOT here
+    envVars:
+      - key: APP_ID
+        sync: false                     # Set via Render dashboard
+      - key: APP_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DB_DIR
+        value: /tmp                     # Ephemeral; jobs re-fetch automatically
+      - key: FETCH_COOLDOWN_SECONDS
+        value: "3600"
+      - key: MAX_STORED_JOBS
+        value: "500"
+      - key: TELEGRAM_MAX_AGE_HOURS
+        value: "48"
+
+    # Health check — Render uses this to confirm the service is up
+    healthCheckPath: /health
